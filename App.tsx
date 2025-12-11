@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { CardData, GameState } from './types';
-import { FULL_DECK, STORAGE_KEY, COLORS } from './constants';
+import { CardData, GameState, SimStats } from './types';
+import { FULL_DECK, STORAGE_KEY } from './constants';
 import DeckTracker from './components/DeckTracker';
 import HandManager from './components/HandManager';
 import { findBestMoves, analyzeDiscards } from './services/gameLogic';
-import { RotateCcw, HelpCircle, Trophy, ArrowRightLeft } from 'lucide-react';
+import { runSimulation } from './services/simulation';
+import { RotateCcw, HelpCircle, Trophy, LayoutGrid, Bot, Activity, X, Play, Settings2 } from 'lucide-react';
 
 const INITIAL_STATE: GameState = {
   removedCardIds: new Set<string>(),
@@ -17,6 +18,13 @@ function App() {
   const [handIds, setHandIds] = useState<(string | null)[]>(INITIAL_STATE.handIds);
   const [currentScore, setCurrentScore] = useState<number>(INITIAL_STATE.currentScore);
   const [showHelp, setShowHelp] = useState(false);
+  const [gameVersion, setGameVersion] = useState(0);
+
+  // Simulation State
+  const [simStats, setSimStats] = useState<SimStats | null>(null);
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [showSimConfig, setShowSimConfig] = useState(false);
+  const [simIterations, setSimIterations] = useState<number>(100);
 
   // Load from LocalStorage
   useEffect(() => {
@@ -44,13 +52,26 @@ function App() {
   }, [removedCardIds, handIds, currentScore]);
 
   // Reset Game
-  const resetGame = () => {
-    if (window.confirm("Are you sure you want to start a new game?")) {
+  const resetGame = (skipConfirm = false) => {
+    if (skipConfirm || window.confirm("Are you sure you want to start a new game?")) {
       setRemovedCardIds(new Set());
       setHandIds([null, null, null, null, null]);
       setCurrentScore(0);
+      setGameVersion(v => v + 1);
       localStorage.removeItem(STORAGE_KEY);
     }
+  };
+
+  // Run Simulation Handler
+  const handleRunSimulation = () => {
+    setShowSimConfig(false);
+    setIsSimulating(true);
+    // Use timeout to allow UI to render loading state
+    setTimeout(() => {
+        const stats = runSimulation(simIterations);
+        setSimStats(stats);
+        setIsSimulating(false);
+    }, 50);
   };
 
   // --- Derived State ---
@@ -71,33 +92,56 @@ function App() {
 
   const discardSuggestions = useMemo(() => {
     if (activeHandCards.length < 5) return [];
-    return analyzeDiscards(activeHandCards, removedCardIds);
-  }, [activeHandCards, removedCardIds]);
+    // Pass currentScore and enable chest calculation (true)
+    return analyzeDiscards(activeHandCards, removedCardIds, currentScore, true);
+  }, [activeHandCards, removedCardIds, currentScore]);
 
+  const isDefeat = availableCards.length === 0 && bestMoves.length === 0 && activeHandCards.length > 0;
+  const isVictory = availableCards.length === 0 && activeHandCards.length === 0;
+  const showGameOverModal = isDefeat || isVictory;
 
   // --- Handlers ---
 
-  const handleToggleRemoved = (id: string) => {
-    const newSet = new Set(removedCardIds);
-    if (newSet.has(id)) {
-      newSet.delete(id);
-    } else {
-      newSet.add(id);
-      setHandIds(prev => prev.map(hId => hId === id ? null : hId));
+  // Smart Click Handler: The core of the new UX
+  const handleSmartCardClick = (card: CardData) => {
+    // 1. If in hand -> Remove from hand
+    if (handIds.includes(card.id)) {
+      setHandIds(prev => prev.map(id => id === card.id ? null : id));
+      return;
     }
-    setRemovedCardIds(newSet);
+    
+    // 2. If removed -> Un-remove (bring back to deck/availability)
+    if (removedCardIds.has(card.id)) {
+      const newRemoved = new Set(removedCardIds);
+      newRemoved.delete(card.id);
+      setRemovedCardIds(newRemoved);
+      return;
+    }
+
+    // 3. If available -> Add to first empty slot in hand
+    const emptyIndex = handIds.indexOf(null);
+    if (emptyIndex !== -1) {
+      const newHand = [...handIds];
+      newHand[emptyIndex] = card.id;
+      setHandIds(newHand);
+    }
   };
 
-  const handleSetHandCard = (index: number, card: CardData) => {
-    const newHand = [...handIds];
-    newHand[index] = card.id;
-    setHandIds(newHand);
-  };
+  // Right Click: Toggle "Removed/Burned" status directly
+  const handleSmartCardRightClick = (card: CardData) => {
+    const newRemoved = new Set(removedCardIds);
+    
+    // If it's in hand, remove it from hand first
+    if (handIds.includes(card.id)) {
+       setHandIds(prev => prev.map(id => id === card.id ? null : id));
+    }
 
-  const handleClearHandCard = (index: number) => {
-    const newHand = [...handIds];
-    newHand[index] = null;
-    setHandIds(newHand);
+    if (newRemoved.has(card.id)) {
+      newRemoved.delete(card.id);
+    } else {
+      newRemoved.add(card.id);
+    }
+    setRemovedCardIds(newRemoved);
   };
 
   const handleExecuteMove = (cards: CardData[], score: number) => {
@@ -122,141 +166,266 @@ function App() {
 
   const handleSortHand = () => {
     const sorted = [...activeHandCards].sort((a, b) => {
-        // Sort by Color Index
-        const colorDiff = COLORS.indexOf(a.color) - COLORS.indexOf(b.color);
-        if (colorDiff !== 0) return colorDiff;
-        // Then by Number
+        if (a.color !== b.color) return a.color.localeCompare(b.color);
         return a.number - b.number;
     });
-
-    // Reconstruct handIds with sorted cards first, then nulls
-    const newHandIds = Array(5).fill(null);
-    sorted.forEach((card, i) => {
-        newHandIds[i] = card.id;
-    });
-    setHandIds(newHandIds);
+    
+    // Create new hand array with sorted cards filled first, then nulls
+    const newHand = [null, null, null, null, null].map((_, idx) => sorted[idx] ? sorted[idx] ? sorted[idx].id : null : null);
+    setHandIds(newHand as (string | null)[]);
   };
-
-  // --- Dynamic Styles ---
 
   const getRankStyle = (score: number) => {
-    if (score >= 400) return 'from-yellow-400 via-yellow-300 to-yellow-500 shadow-yellow-500/50'; // Gold
-    if (score >= 300) return 'from-slate-300 via-slate-200 to-slate-400 shadow-slate-400/50'; // Silver
-    return 'from-orange-700 via-orange-600 to-orange-800 shadow-orange-700/50'; // Bronze
+    if (score >= 400) return 'from-yellow-400 via-yellow-300 to-yellow-500 shadow-yellow-500/50';
+    if (score >= 300) return 'from-slate-300 via-slate-200 to-slate-400 shadow-slate-400/50';
+    return 'from-orange-700 via-orange-600 to-orange-800 shadow-orange-700/50';
   };
 
-  const rankColor = getRankStyle(currentScore);
-
   return (
-    <div className="min-h-screen bg-slate-900 pb-20 font-sans text-slate-100 selection:bg-indigo-500/30">
+    <div className="min-h-screen bg-slate-950 font-sans text-slate-100 selection:bg-indigo-500/30 overflow-x-hidden flex flex-col">
       
-      {/* Header */}
-      <header className="bg-slate-800/90 backdrop-blur-md border-b border-slate-700 sticky top-0 z-40 shadow-lg">
-        <div className="max-w-4xl mx-auto px-4 py-3 flex justify-between items-center">
-          <div className="flex items-center gap-3">
-             <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center shadow-inner ring-1 ring-indigo-400/30">
-               <span className="text-xl font-black text-indigo-100">O</span>
+      {/* Centered Header */}
+      <header className="bg-slate-900/90 backdrop-blur-md border-b border-slate-800 sticky top-0 z-40 shadow-sm flex-none">
+        <div className="max-w-7xl mx-auto px-4 py-2 grid grid-cols-3 items-center">
+          
+          {/* Left: Logo */}
+          <div className="flex items-center gap-2 justify-start">
+             <div className="w-8 h-8 bg-indigo-600 rounded flex items-center justify-center shadow-inner">
+               <span className="text-lg font-black text-indigo-100">O</span>
              </div>
-             <div>
-               <h1 className="font-bold text-lg leading-tight tracking-tight">Okey Master</h1>
-               <p className="text-[10px] uppercase font-bold text-slate-500 hidden sm:block">Metin2 Companion</p>
-             </div>
+             <h1 className="font-bold text-base leading-none hidden sm:block">Okey<br/><span className="text-slate-500 text-[10px] uppercase">Master</span></h1>
           </div>
 
-          <div className="flex items-center gap-4">
-             <div className="flex flex-col items-end">
-               <span className="text-[10px] uppercase font-bold text-slate-500">Current Score</span>
-               <span className={`text-2xl font-mono font-bold leading-none ${currentScore >= 400 ? 'text-yellow-400' : currentScore >= 300 ? 'text-slate-200' : 'text-orange-400'}`}>
-                 {currentScore}
-               </span>
-             </div>
-             <button onClick={() => setShowHelp(true)} className="p-2 text-slate-400 hover:text-white transition-colors hover:bg-slate-700 rounded-full">
-               <HelpCircle size={24} />
+          {/* Center: Score */}
+          <div className="flex flex-col items-center justify-center">
+             <span className={`text-2xl font-mono font-bold leading-none ${currentScore >= 400 ? 'text-yellow-400' : currentScore >= 300 ? 'text-slate-200' : 'text-orange-400'}`}>
+               {currentScore}
+             </span>
+             <span className="text-[9px] uppercase font-bold text-slate-600 tracking-wider">Score</span>
+          </div>
+
+          {/* Right: Actions */}
+          <div className="flex items-center gap-2 justify-end">
+             <button onClick={() => setShowSimConfig(true)} disabled={isSimulating} className="p-2 text-slate-500 hover:text-emerald-400 transition-colors rounded-full hover:bg-slate-800 disabled:opacity-50" title="Run AI Simulation">
+               {isSimulating ? <Activity size={18} className="animate-spin" /> : <Bot size={18} />}
+             </button>
+             <button onClick={() => resetGame()} className="p-2 text-slate-500 hover:text-red-400 transition-colors rounded-full hover:bg-slate-800" title="Reset Game">
+                <RotateCcw size={18} />
+             </button>
+             <button onClick={() => setShowHelp(true)} className="p-2 text-slate-500 hover:text-white transition-colors rounded-full hover:bg-slate-800">
+               <HelpCircle size={18} />
              </button>
           </div>
         </div>
         
-        {/* Dynamic Goal Progress */}
-        <div className="relative h-1.5 w-full bg-slate-900 overflow-hidden">
+        {/* Progress Bar */}
+        <div className="relative h-1 w-full bg-slate-900">
            <div 
-             className={`absolute top-0 left-0 h-full bg-gradient-to-r transition-all duration-1000 shadow-[0_0_10px_rgba(0,0,0,0.5)] ${rankColor}`}
+             className={`absolute top-0 left-0 h-full bg-gradient-to-r transition-all duration-1000 ${getRankStyle(currentScore)}`}
              style={{ width: `${Math.min(100, (currentScore / 450) * 100)}%` }}
            ></div>
-           
-           {/* Threshold Markers */}
-           <div className="absolute top-0 left-[66%] h-full w-0.5 bg-slate-900/50 z-10" title="Silver Start (300)"></div>
-           <div className="absolute top-0 left-[88%] h-full w-0.5 bg-slate-900/50 z-10" title="Gold Start (400)"></div>
+           <div className="absolute top-0 left-[66%] h-full w-px bg-white/20 z-10"></div>
+           <div className="absolute top-0 left-[88%] h-full w-px bg-white/20 z-10"></div>
         </div>
       </header>
 
-      <main className="max-w-3xl mx-auto px-4 py-8 space-y-10">
+      {/* Main Content */}
+      <main className="flex-grow flex flex-col justify-center w-full max-w-7xl mx-auto px-2 sm:px-4 py-6">
         
-        {/* Helper Modal */}
-        {showHelp && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in" onClick={() => setShowHelp(false)}>
-            <div className="bg-slate-800 rounded-2xl max-w-lg w-full p-6 border border-slate-600 shadow-2xl relative" onClick={e => e.stopPropagation()}>
-              <h2 className="text-2xl font-bold mb-4 text-white">Strategy Guide</h2>
-              <ul className="space-y-3 text-slate-300 list-disc pl-5 mb-6 text-sm leading-relaxed">
-                <li><strong>Tracker:</strong> Monitor remaining cards to predict future draws.</li>
-                <li><strong>Hand:</strong> Click slots to add cards. Use "Sort" to organize by color.</li>
-                <li><strong>Greedy AI:</strong> The suggestions now prioritize <strong>HIGH SCORES</strong>. It may suggest discarding a "safe" card if holding another card could lead to a 6-7-8 Same Color (100 pts).</li>
-                <li><strong>Goal:</strong> Aim for 400+ points for the Golden Chest.</li>
-              </ul>
-              
-              <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-700 mb-6">
-                <h3 className="font-bold text-white text-sm mb-2 uppercase tracking-wide">Scoring Reference</h3>
-                <div className="grid grid-cols-2 gap-4 text-xs text-slate-400">
-                    <div>
-                        <span className="text-emerald-400 font-bold block mb-1">Straight Flush (+40)</span>
-                        1-2-3 (50) ... 6-7-8 (100)
+        {/* Simulation Configuration Modal */}
+        {showSimConfig && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={() => setShowSimConfig(false)}>
+              <div className="bg-slate-800 p-6 rounded-xl max-w-sm w-full border border-slate-700 shadow-2xl" onClick={e => e.stopPropagation()}>
+                  <h3 className="text-xl font-bold mb-4 text-white flex items-center gap-2">
+                      <Bot className="text-emerald-400"/> Simulation Setup
+                  </h3>
+                  <div className="mb-6">
+                      <label className="block text-sm font-medium text-slate-400 mb-2">Number of Games</label>
+                      <input 
+                          type="number" 
+                          min="1" 
+                          max="100000"
+                          value={simIterations}
+                          onChange={(e) => {
+                             const val = parseInt(e.target.value);
+                             if (!isNaN(val)) setSimIterations(val);
+                          }}
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-white focus:ring-2 focus:ring-emerald-500 outline-none font-mono"
+                      />
+                      <p className="text-xs text-slate-500 mt-2 leading-relaxed">
+                          Enter how many games the AI should play to test the current strategy. 
+                          <br/><span className="opacity-70">Recommended: 100 - 10,000</span>
+                      </p>
+                  </div>
+                  <div className="flex gap-3">
+                      <button onClick={() => setShowSimConfig(false)} className="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-200 py-2.5 rounded-lg font-bold transition-colors">Cancel</button>
+                      <button onClick={handleRunSimulation} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 rounded-lg font-bold transition-colors shadow-lg shadow-emerald-900/20 flex items-center justify-center gap-2">
+                          <Play size={16} fill="currentColor" /> Run
+                      </button>
+                  </div>
+              </div>
+            </div>
+        )}
+
+        {/* Simulation Stats Modal */}
+        {simStats && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={() => setSimStats(null)}>
+              <div className="bg-slate-800 border border-slate-700 rounded-xl max-w-md w-full shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+                <div className="bg-slate-900 px-6 py-4 border-b border-slate-700 flex justify-between items-center">
+                    <h3 className="font-bold text-slate-200 flex items-center gap-2">
+                        <Bot size={20} className="text-emerald-400" />
+                        AI Performance Report
+                    </h3>
+                    <button onClick={() => setSimStats(null)} className="text-slate-500 hover:text-white"><X size={20}/></button>
+                </div>
+                <div className="p-6">
+                    <div className="grid grid-cols-2 gap-4 mb-6">
+                        <div className="bg-slate-900/50 p-3 rounded-lg text-center">
+                            <div className="text-xs text-slate-500 uppercase font-bold">Total Games</div>
+                            <div className="text-xl font-mono text-white">{simStats.totalGames}</div>
+                        </div>
+                        <div className="bg-slate-900/50 p-3 rounded-lg text-center">
+                            <div className="text-xs text-slate-500 uppercase font-bold">Avg. Score</div>
+                            <div className="text-xl font-mono text-emerald-400">{simStats.averageScore}</div>
+                        </div>
                     </div>
-                    <div>
-                        <span className="text-blue-400 font-bold block mb-1">Triples</span>
-                        1,1,1 (20) ... 8,8,8 (90)
+
+                    <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-3">Chest Distribution</h4>
+                    <div className="space-y-3">
+                        <div className="flex items-center gap-3">
+                            <div className="w-16 text-xs font-bold text-yellow-400 text-right">GOLD</div>
+                            <div className="flex-1 h-6 bg-slate-900 rounded-full overflow-hidden relative">
+                                <div className="absolute top-0 left-0 h-full bg-yellow-500/80" style={{ width: `${(simStats.goldCount / simStats.totalGames) * 100}%` }}></div>
+                            </div>
+                            <div className="w-10 text-xs font-mono text-slate-300 text-right">{simStats.goldCount}</div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <div className="w-16 text-xs font-bold text-slate-300 text-right">SILVER</div>
+                            <div className="flex-1 h-6 bg-slate-900 rounded-full overflow-hidden relative">
+                                <div className="absolute top-0 left-0 h-full bg-slate-400/80" style={{ width: `${(simStats.silverCount / simStats.totalGames) * 100}%` }}></div>
+                            </div>
+                            <div className="w-10 text-xs font-mono text-slate-300 text-right">{simStats.silverCount}</div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <div className="w-16 text-xs font-bold text-orange-400 text-right">BRONZE</div>
+                            <div className="flex-1 h-6 bg-slate-900 rounded-full overflow-hidden relative">
+                                <div className="absolute top-0 left-0 h-full bg-orange-600/80" style={{ width: `${(simStats.bronzeCount / simStats.totalGames) * 100}%` }}></div>
+                            </div>
+                            <div className="w-10 text-xs font-mono text-slate-300 text-right">{simStats.bronzeCount}</div>
+                        </div>
+                    </div>
+                    
+                    <div className="mt-6 text-center">
+                         <div className="text-[10px] text-slate-500">Highest Score Achieved: <span className="text-emerald-400 font-bold">{simStats.highScore}</span></div>
                     </div>
                 </div>
               </div>
+            </div>
+        )}
 
-              <div className="text-right">
-                <button onClick={() => setShowHelp(false)} className="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-lg font-bold transition-transform active:scale-95">Let's Play</button>
-              </div>
+        {/* Game Over Modal */}
+        {showGameOverModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4 animate-in fade-in duration-300">
+            <div className="bg-slate-900 rounded-2xl max-w-sm w-full p-8 border border-slate-700 shadow-2xl text-center relative overflow-hidden">
+               <div className={`absolute inset-0 opacity-10 bg-gradient-to-br ${getRankStyle(currentScore)}`}></div>
+               <div className="relative z-10">
+                  <h2 className="text-2xl font-black text-white mb-2">{isVictory ? "PERFECT CLEAR!" : "GAME OVER"}</h2>
+                  <div className="text-5xl font-mono font-bold mb-4">{currentScore}</div>
+                  <button onClick={() => resetGame(true)} className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 rounded-xl transition-colors">
+                    Restart
+                  </button>
+               </div>
             </div>
           </div>
         )}
 
-        <div className="flex flex-col gap-8">
+        {/* Help Modal */}
+        {showHelp && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={() => setShowHelp(false)}>
+            <div className="bg-slate-800 p-6 rounded-xl max-w-md w-full border border-slate-700 shadow-2xl" onClick={e => e.stopPropagation()}>
+               <h3 className="text-xl font-bold mb-4 text-center">Controls Guide</h3>
+               <div className="space-y-4 text-sm text-slate-300 mb-6">
+                 <div className="flex items-center gap-4 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
+                    <div className="w-8 h-8 rounded-full bg-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold shrink-0">L</div>
+                    <div>
+                        <span className="text-indigo-400 font-bold block">Left Click</span>
+                        <span className="text-slate-400 text-xs">Add to hand / Remove from hand</span>
+                    </div>
+                 </div>
+                 <div className="flex items-center gap-4 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
+                    <div className="w-8 h-8 rounded-full bg-red-500/20 flex items-center justify-center text-red-400 font-bold shrink-0">R</div>
+                    <div>
+                        <span className="text-red-400 font-bold block">Right Click</span>
+                        <span className="text-slate-400 text-xs">Burn / Remove permanently</span>
+                    </div>
+                 </div>
+               </div>
+               <button onClick={() => setShowHelp(false)} className="w-full bg-slate-700 hover:bg-slate-600 py-3 rounded-lg font-bold transition-colors">Close</button>
+            </div>
+          </div>
+        )}
+
+        {/* Main Grid Layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start w-full">
           
-          {/* Main Hand Manager Area */}
-          <section className="relative">
-             <div className="flex justify-between items-center mb-4 px-2">
-                <h2 className="text-lg font-bold text-slate-200 flex items-center gap-2">
-                   Active Hand
-                   <span className="text-xs font-bold text-slate-900 bg-slate-400 px-2 py-0.5 rounded-full">{activeHandCards.length}/5</span>
-                </h2>
-                <div className="flex gap-3">
-                    <button 
-                        onClick={handleSortHand}
-                        disabled={activeHandCards.length === 0}
-                        className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-indigo-300 px-3 py-1.5 rounded-lg border border-slate-700 transition-colors disabled:opacity-50"
-                    >
-                        <ArrowRightLeft size={14} /> Sort Hand
-                    </button>
-                    <button 
-                        onClick={resetGame}
-                        className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-red-900/30 text-red-400 px-3 py-1.5 rounded-lg border border-slate-700 transition-colors"
-                    >
-                        <RotateCcw size={14} /> Reset
-                    </button>
-                </div>
+          {/* LEFT COLUMN: Game Board (Hand + Analysis) */}
+          <div className="lg:col-span-7 flex flex-col gap-4 order-2 lg:order-1">
+             <section className="bg-slate-900/50 border border-slate-800 rounded-xl p-4 sm:p-6 shadow-xl relative">
+                 <div className="flex justify-between items-center mb-4">
+                    <h2 className="text-sm font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                       Your Hand
+                    </h2>
+                    {activeHandCards.length > 0 && (
+                        <button 
+                            onClick={handleSortHand}
+                            className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1 rounded border border-slate-700 transition-colors flex items-center gap-1"
+                        >
+                            <LayoutGrid size={12} /> Sort
+                        </button>
+                    )}
+                 </div>
+                 
+                 <HandManager 
+                   key={gameVersion}
+                   hand={handCards}
+                   availableCards={availableCards}
+                   onClearCard={(idx) => {
+                       const newHand = [...handIds];
+                       newHand[idx] = null;
+                       setHandIds(newHand);
+                   }}
+                   bestMoves={bestMoves}
+                   discardSuggestions={discardSuggestions}
+                   onExecuteMove={handleExecuteMove}
+                   onDiscard={handleDiscard}
+                 />
+             </section>
+          </div>
+
+          {/* RIGHT COLUMN: Deck Tracker / Input Source */}
+          <div className="lg:col-span-5 order-1 lg:order-2">
+             <div className="sticky top-24">
+                 <DeckTracker 
+                   key={gameVersion}
+                   removedIds={removedCardIds}
+                   handIds={handIds}
+                   onCardClick={handleSmartCardClick}
+                   onCardRightClick={handleSmartCardRightClick}
+                 />
              </div>
-             
-             <HandManager 
-               hand={handCards}
-               availableCards={availableCards}
-               onSetCard={handleSetHandCard}
-               onClearCard={handleClearHandCard}
-               bestMoves={bestMoves}
-               discardSuggestions={discardSuggestions}
-               onExecuteMove={handleExecuteMove}
-               onDiscard={handleDiscard}
-             
+          </div>
+
+        </div>
+      </main>
+
+      {/* Golden Chest Indicator */}
+      {currentScore >= 400 && !showGameOverModal && (
+         <div className="fixed bottom-6 right-6 z-50 animate-bounce pointer-events-none">
+            <Trophy size={32} className="text-yellow-400 drop-shadow-[0_0_15px_rgba(250,204,21,0.8)]" />
+         </div>
+      )}
+    </div>
+  );
+}
+
+export default App;

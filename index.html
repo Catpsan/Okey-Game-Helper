@@ -7,12 +7,12 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
       body {
-        background-color: #0f172a; /* Slate 900 */
+        background-color: #211D1D; /* Slate 900 */
         color: #e2e8f0; /* Slate 200 */
       }
       /* Custom Scrollbar for a game-like feel */
       ::-webkit-scrollbar {
-        width: 8px;
+        width: 5px;
       }
       ::-webkit-scrollbar-track {
         background: #1e293b;
@@ -28,10 +28,12 @@
   <script type="importmap">
 {
   "imports": {
-    "react/": "https://esm.sh/react@^19.2.2/",
-    "react": "https://esm.sh/react@^19.2.2",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.2/",
-    "lucide-react": "https://esm.sh/lucide-react@^0.560.0"
+    "react": "https://esm.sh/react@18.2.0",
+    "react/": "https://esm.sh/react@18.2.0/",
+    "react-dom": "https://esm.sh/react-dom@18.2.0?deps=react@18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client?deps=react@18.2.0",
+    "lucide-react": "https://esm.sh/lucide-react@0.292.0?deps=react@18.2.0",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/"
   }
 }
 </script>

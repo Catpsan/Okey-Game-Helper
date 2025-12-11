@@ -1,23 +1,32 @@
-import { CardData, ComboResult, DiscardSuggestion } from '../types';
+import { CardData, ComboResult, DiscardSuggestion, Prediction, ChestProbabilities } from '../types';
 import { FULL_DECK } from '../constants';
+
+// --- Utils ---
+export const shuffle = (array: CardData[]) => {
+    let currentIndex = array.length, randomIndex;
+    const newArray = [...array];
+    while (currentIndex !== 0) {
+        randomIndex = Math.floor(Math.random() * currentIndex);
+        currentIndex--;
+        [newArray[currentIndex], newArray[randomIndex]] = [newArray[randomIndex], newArray[currentIndex]];
+    }
+    return newArray;
+};
 
 // --- Scoring Logic ---
 
 const getSequenceBaseScore = (startNum: number): number => {
-  // 1-2-3=10, 2-3-4=20, ... 6-7-8=60
-  // Formula: (StartNum - 1) * 10 + 10  => StartNum * 10
   return startNum * 10;
 };
 
 const getTripleScore = (num: number): number => {
-  // 1=20, 2=30, ... 8=90
-  // Formula: num * 10 + 10
   return num * 10 + 10;
 };
 
 export const calculateScore = (cards: CardData[]): ComboResult => {
   if (cards.length !== 3) return { cards, score: 0, type: 'none' };
 
+  // Sort by number
   const sorted = [...cards].sort((a, b) => a.number - b.number);
   const c1 = sorted[0];
   const c2 = sorted[1];
@@ -31,13 +40,14 @@ export const calculateScore = (cards: CardData[]): ComboResult => {
 
   // Check Sequence
   if (consecutive) {
-    let score = getSequenceBaseScore(c1.number);
-    if (sameColor) score += 40;
+    let score = getSequenceBaseScore(c1.number); // 1-2-3=10 ... 6-7-8=60
+    if (sameColor) score += 40; // Bonus for Flush. 6-7-8 Flush = 100pts
     return { cards: sorted, score, type: 'sequence', isSameColor: sameColor };
   }
 
   // Check Triple
   if (sameNumber && distinctColors) {
+    // 1,1,1=20 ... 8,8,8=90
     return { cards: sorted, score: getTripleScore(c1.number), type: 'triple' };
   }
 
@@ -46,7 +56,6 @@ export const calculateScore = (cards: CardData[]): ComboResult => {
 
 // --- Combinatorics ---
 
-// Helper to get all combinations of size k from array
 function getCombinations<T>(array: T[], size: number): T[][] {
   const result: T[][] = [];
   function fork(target: T[], source: T[]) {
@@ -66,111 +75,183 @@ export const findBestMoves = (hand: CardData[]): ComboResult[] => {
   const scoredCombos = combos
     .map(c => calculateScore(c))
     .filter(res => res.score > 0)
-    .sort((a, b) => b.score - a.score); // Descending score
+    .sort((a, b) => b.score - a.score);
   return scoredCombos;
 };
 
 // --- AI / Prediction ---
 
+// Helper: Calculate the "Intrinsic Worth" of a card given a set of available cards (deck + hand)
+// This answers: "How many points does this card contribute to in the universe of remaining possibilities?"
+const calculateCardIntrinsicWorth = (card: CardData, contextCards: CardData[]): number => {
+    let totalWorth = 0;
+    
+    // Static Bonus for High Value Cards (6, 7, 8)
+    // These are required for the highest scoring combinations (6-7-8 Flush = 100, 8-8-8 = 90)
+    // We give them a huge "potential" buffer so they aren't discarded early just because they don't connect yet.
+    if (card.number >= 6) {
+        totalWorth += 50000 * (card.number - 5); // 6->50k, 7->100k, 8->150k
+    }
+
+    const pairs = getCombinations(contextCards, 2);
+    for (const pair of pairs) {
+        const result = calculateScore([card, ...pair]);
+        if (result.score > 0) {
+            totalWorth += Math.pow(result.score, 3); 
+        }
+    }
+    return totalWorth;
+};
+
+// Monte Carlo Simulation Helper
+const runMonteCarlo = (
+    initialHand: CardData[], 
+    initialDeck: CardData[], 
+    initialRemoved: Set<string>, 
+    startScore: number
+): ChestProbabilities => {
+    const ITERATIONS = 20; // Lightweight simulation count
+    let golds = 0, silvers = 0, bronzes = 0;
+    
+    for(let i=0; i<ITERATIONS; i++) {
+        let deck = shuffle([...initialDeck]);
+        let hand = [...initialHand];
+        let removed = new Set(initialRemoved);
+        let score = startScore;
+        let active = true;
+        
+        while(active) {
+            // Fill hand
+            while(hand.length < 5 && deck.length > 0) {
+                hand.push(deck.pop()!);
+            }
+            
+            if(hand.length < 3 && deck.length === 0) { active = false; break; }
+            
+            const moves = findBestMoves(hand);
+            if(moves.length > 0) {
+                 const move = moves[0];
+                 score += move.score;
+                 const playedIds = new Set(move.cards.map(c => c.id));
+                 hand = hand.filter(c => !playedIds.has(c.id));
+                 move.cards.forEach(c => removed.add(c.id));
+            } else {
+                 if(deck.length === 0) { active = false; break; }
+                 
+                 // AI Discard: Recurse without chest calc (fast mode)
+                 const suggestions = analyzeDiscards(hand, removed, score, false);
+                 if(suggestions.length > 0) {
+                     const discard = suggestions[0].cardToRemove;
+                     hand = hand.filter(c => c.id !== discard.id);
+                     removed.add(discard.id);
+                 } else {
+                     active = false;
+                 }
+            }
+        }
+        
+        if (score >= 400) golds++;
+        else if (score >= 300) silvers++;
+        else bronzes++;
+    }
+    
+    return {
+        gold: Math.round((golds / ITERATIONS) * 100),
+        silver: Math.round((silvers / ITERATIONS) * 100),
+        bronze: Math.round((bronzes / ITERATIONS) * 100)
+    };
+};
+
 export const analyzeDiscards = (
   currentHand: CardData[],
-  removedCardIds: Set<string>
+  removedCardIds: Set<string>,
+  currentScore: number = 0,
+  calculateChestStats: boolean = false
 ): DiscardSuggestion[] => {
-  // Remaining deck = Full Deck - Removed - Current Hand
   const currentHandIds = new Set(currentHand.map(c => c.id));
-  const remainingDeck = FULL_DECK.filter(
-    c => !removedCardIds.has(c.id) && !currentHandIds.has(c.id)
-  );
+  
+  // The universe of cards that are NOT removed.
+  const availableUniverse = FULL_DECK.filter(c => !removedCardIds.has(c.id));
+  
+  // The Draw Pile specifically
+  const remainingDeck = availableUniverse.filter(c => !currentHandIds.has(c.id));
 
   if (remainingDeck.length === 0) return [];
 
+  // Pre-calculate intrinsic worth for every card in the hand.
+  const cardWorths = new Map<string, number>();
+  for (const card of currentHand) {
+      const otherContext = availableUniverse.filter(c => c.id !== card.id);
+      cardWorths.set(card.id, calculateCardIntrinsicWorth(card, otherContext));
+  }
+
   const suggestions: DiscardSuggestion[] = [];
 
-  // Try discarding each card in hand
   for (const cardToRemove of currentHand) {
-    const tempHandBase = currentHand.filter(c => c.id !== cardToRemove.id);
+    const keptHand = currentHand.filter(c => c.id !== cardToRemove.id);
     
-    // 1. Immediate Utility Analysis (Simulation)
-    let totalMaxScore = 0;
+    // Metric 1: Immediate Draw Potential (EV)
+    let sumWeightedScores = 0;
     let winningOuts = 0;
     let maxPossibleScore = 0;
+    let bestPrediction: Prediction | null = null;
 
-    // Simulate drawing every possible remaining card
     for (const drawnCard of remainingDeck) {
-      const simulatedHand = [...tempHandBase, drawnCard];
+      const simulatedHand = [...keptHand, drawnCard];
       const moves = findBestMoves(simulatedHand);
       
       if (moves.length > 0) {
         const score = moves[0].score;
-        totalMaxScore += score; // Assume player takes best move
+        sumWeightedScores += Math.pow(score, 3); 
         winningOuts++;
-        if (score > maxPossibleScore) {
-            maxPossibleScore = score;
+        if (score > maxPossibleScore) maxPossibleScore = score;
+
+        if (!bestPrediction || score > bestPrediction.score) {
+             const winningMove = moves[0];
+             const usedIds = new Set(winningMove.cards.map(c => c.id));
+             const usedKeptCards = keptHand.filter(c => usedIds.has(c.id));
+             
+             bestPrediction = {
+                 keptCards: usedKeptCards,
+                 neededCard: drawnCard,
+                 score: score,
+                 type: winningMove.type as 'triple' | 'sequence'
+             };
         }
       }
     }
 
-    // 2. Long-term Safety Analysis (Potential future combos lost)
-    // Count how many pairs in remainingDeck form a valid combo with cardToRemove
-    let lostCombos = 0;
-    let lostHighValueCombos = 0;
-
-    if (remainingDeck.length >= 2) {
-      const remainingPairs = getCombinations(remainingDeck, 2);
-      for (const pair of remainingPairs) {
-        const result = calculateScore([cardToRemove, ...pair]);
-        if (result.score > 0) {
-          lostCombos++;
-          // Heavily weight losing a 6-7-8 Same Color or High Triple
-          if (result.score >= 90) {
-            lostHighValueCombos++;
-          }
-        }
-      }
+    // Metric 2: Retention Value
+    let retentionValue = 0;
+    for (const kept of keptHand) {
+        retentionValue += (cardWorths.get(kept.id) || 0);
     }
+    const opportunityCost = cardWorths.get(cardToRemove.id) || 0;
+
+    // COMPOSITE SCORE INDEX
+    const immediateFactor = sumWeightedScores; 
+    const retentionFactor = retentionValue / 10; 
     
-    // safeDiscardScore: Higher is better (safer).
-    // Penalize heavily for losing high value combos
-    const safeDiscardScore = Math.max(0, 100 - lostCombos - (lostHighValueCombos * 10));
+    const scoreIndex = immediateFactor + retentionFactor;
+
+    // --- Monte Carlo Chest Probability ---
+    let chestProbabilities: ChestProbabilities | undefined;
+    if (calculateChestStats) {
+        chestProbabilities = runMonteCarlo(keptHand, remainingDeck, removedCardIds, currentScore);
+    }
 
     suggestions.push({
       cardToRemove,
       probability: winningOuts / remainingDeck.length,
-      averagePotentialScore: winningOuts > 0 ? totalMaxScore / remainingDeck.length : 0,
+      averagePotentialScore: winningOuts > 0 ? Math.pow(sumWeightedScores / winningOuts, 1/3) : 0, 
       maxPossibleScore,
       outs: winningOuts,
-      safeDiscardScore
+      safeDiscardScore: opportunityCost, 
+      scoreIndex: scoreIndex,
+      prediction: bestPrediction,
+      chestProbabilities
     });
   }
 
-  // STRATEGY SORTING:
-  // To reach 400+, we need to prioritize MAX potential score.
-  // We should NOT discard a card that allows a 100pt hand just because it has low probability,
-  // unless the alternative is also good.
-  
-  return suggestions.sort((a, b) => {
-    // 1. If one card allows for a Massive score (e.g. 90-100) and the other doesn't,
-    // we should really try to keep the high score card (so we want to discard the LOW score card).
-    // So if A has Max 100 and B has Max 40, we want to discard B.
-    // Sort descending by "Desirability to Keep".
-    // Discard Suggestion list is "Best to Discard" first.
-    // So we want the card with LOWER max potential to be first.
-    
-    const aMax = a.maxPossibleScore;
-    const bMax = b.maxPossibleScore;
-
-    // If there is a huge disparity in max potential (e.g. keeping a 1 vs keeping a 7), 
-    // prioritize getting rid of the low potential one.
-    if (Math.abs(bMax - aMax) >= 30) {
-        return aMax - bMax; // Discard the one with lower max potential
-    }
-
-    // 2. If max potentials are similar, look at Probability (Survival)
-    if (Math.abs(b.probability - a.probability) > 0.15) {
-      return b.probability - a.probability;
-    }
-
-    // 3. Fallback to Safe Discard Score (Don't break future combos)
-    return b.safeDiscardScore - a.safeDiscardScore;
-  });
+  return suggestions.sort((a, b) => b.scoreIndex - a.scoreIndex);
 };
