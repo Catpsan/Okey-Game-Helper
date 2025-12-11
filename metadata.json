@@ -1,0 +1,5 @@
+{
+  "name": "Okey Card Master",
+  "description": "An intelligent companion for the Metin2 Okey Card Game. Features card tracking, move analysis, and probabilistic discard suggestions to maximize score.",
+  "requestFramePermissions": []
+}
